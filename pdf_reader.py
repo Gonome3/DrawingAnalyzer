@@ -5,12 +5,16 @@ Usage:
     python pdf_reader.py <filepath>
 """
 
+import os
 import sys
 import json
 import math
+import base64
 import argparse
+import urllib.request
+import urllib.error
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 try:
     import pymupdf  # PyMuPDF
@@ -279,6 +283,220 @@ def format_as_compact_text(data: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# LLM extraction pipeline
+# ---------------------------------------------------------------------------
+
+DRAWING_SCHEMA_DESCRIPTION = """\
+You are extracting structured data from an engineering drawing. Return a SINGLE
+JSON object matching the schema below. Use both the rendered page image(s) and
+the extracted text spans (each span gives the literal text and its bounding box
+in PDF points -- top-left origin, Y increases downward).
+
+SCHEMA (all fields nullable if absent in the drawing; arrays may be empty):
+{
+  "drawing": {
+    "drawing_number": str, "revision": str, "title": str, "size": str,
+    "scale": str, "units": "in"|"mm", "weight": {"value": float, "unit": str}|null,
+    "material": str, "finish": str, "projection": "third_angle"|"first_angle"|null,
+    "sheet": {"current": int, "total": int}, "company": str
+  },
+  "default_tolerances": {
+    "linear_2_place": {"plus": float, "minus": float, "unit": "in"|"mm"},
+    "linear_3_place": {"plus": float, "minus": float, "unit": "in"|"mm"},
+    "angular":        {"plus": float, "minus": float, "unit": "deg"}
+  },
+  "approvals":  [{"role": "drawn"|"reviewed"|"approved", "name": str, "date": "YYYY-MM-DD"}],
+  "revisions":  [{"rev": str, "description": str, "date": "YYYY-MM-DD", "approved_by": str}],
+  "notes":      [{"number": int, "text": str}],
+  "dimensions": [
+    {
+      "id": "d1", "kind": "linear"|"radius"|"diameter"|"angle",
+      "nominal": float, "unit": "in"|"mm"|"deg",
+      "tolerance": {
+        "source": "explicit"|"default_2_place"|"default_3_place"|"default_angular",
+        "plus": float, "minus": float
+      },
+      "semantic_role": "overall_length"|"overall_width"|"overall_height"|
+                       "edge_to_feature_distance"|"hole_diameter"|"hole_depth"|
+                       "fillet_radius"|"thread_depth"|"other",
+      "view": "front"|"top"|"right"|"left"|"isometric"|"section"|"detail"|null,
+      "axis": "x"|"y"|"z"|null,
+      "feature_ref": "f1"|null,
+      "modifier": "TYP"|"REF"|"BASIC"|null,
+      "source_text": str
+    }
+  ],
+  "features": [
+    {
+      "id": "f1",
+      "kind": "through_hole"|"blind_hole"|"threaded_hole"|"counterbore"|
+              "countersink"|"fillet"|"chamfer"|"slot"|"pocket"|"other",
+      "diameter":    {"value": float, "unit": "in"|"mm"}|null,
+      "depth":       {"value": float, "unit": "in"|"mm"}|null,
+      "radius":      {"value": float, "unit": "in"|"mm"}|null,
+      "thread_spec": str|null,
+      "modifier":    "THRU"|null,
+      "applies_to":  "all_corners"|"all_edges"|null,
+      "view":        "front"|"top"|"right"|"left"|"isometric"|"section"|"detail"|null,
+      "source_text": str
+    }
+  ],
+  "surface_finish": {"minimum_ra": int, "applies_unless_otherwise_specified": bool}|null
+}
+
+RULES:
+1. For every dimension WITHOUT an explicit ± tolerance on the drawing, fill in
+   the inherited default from `default_tolerances` and set `tolerance.source`
+   accordingly (e.g. "4.00" with no ± uses default_2_place).
+2. ALWAYS include `source_text` -- the exact string as it appears on the drawing.
+3. Use ids "d1", "d2", ... for dimensions and "f1", "f2", ... for features.
+4. When a dimension describes a specific feature (e.g. a hole diameter, a
+   fillet radius, an edge-to-hole distance), set `feature_ref` to that feature's id.
+5. Determine `view` from which view the annotation sits inside.
+6. Output ONLY the JSON object -- no commentary, no markdown fences."""
+
+
+def load_config(path: Optional[str] = None) -> dict:
+    """Load the LLM endpoint config from a JSON file. Search order:
+       1. The path passed in on the command line (--config)
+       2. The PDF_EXTRACTOR_CONFIG environment variable
+       3. config.json next to this script
+
+    Expected file shape:
+       {
+         "api_key":  "...",
+         "endpoint": "https://your-ollama-host.example.com/api/chat",
+         "model":    "llava"
+       }
+    """
+    candidates: list = []
+    if path:
+        candidates.append(Path(path))
+    env_path = os.environ.get("PDF_EXTRACTOR_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path(__file__).parent / "config.json")
+
+    for p in candidates:
+        if p.exists() and p.is_file():
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+            if not cfg.get("api_key"):
+                raise ValueError(f"Config file {p} is missing required field 'api_key'")
+            return {
+                "api_key": cfg["api_key"],
+                # Placeholder endpoint -- replace in your config.json
+                "endpoint": cfg.get("endpoint", "https://ollama.example.com/api/chat"),
+                "model": cfg.get("model", "llava"),
+                "_source": str(p),
+            }
+
+    tried = "\n  ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        "No config file found. Create config.json (see config.example.json) with at "
+        "minimum an 'api_key' field, or set the PDF_EXTRACTOR_CONFIG env var.\n"
+        f"Searched:\n  {tried}"
+    )
+
+
+def render_page_to_base64_png(page: Any, dpi: int = 200) -> str:
+    """Rasterize a PDF page to a base64-encoded PNG string. 200 DPI is a
+    good balance for vision models -- detailed enough to read small dimension
+    text, not so large that we balloon the request payload."""
+    zoom = dpi / 72.0
+    matrix = pymupdf.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    png_bytes = pix.tobytes("png")
+    return base64.b64encode(png_bytes).decode("ascii")
+
+
+def call_ollama(config: dict, prompt: str, images_b64: list, timeout: int = 300) -> dict:
+    """POST to an Ollama-compatible /api/chat endpoint with text + images and
+    return the parsed JSON response from `message.content`. Uses `format: json`
+    so the model is constrained to valid JSON output."""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config['api_key']}",
+    }
+    payload = {
+        "model": config["model"],
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert at parsing mechanical engineering drawings "
+                    "into structured JSON. You are precise, faithful to the drawing, "
+                    "and never invent values that are not visible."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+                "images": images_b64,
+            },
+        ],
+        "stream": False,
+        "format": "json",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        config["endpoint"], data=body, headers=headers, method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"LLM endpoint returned HTTP {e.code}: {e.reason}\nBody: {err_body[:500]}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Could not reach LLM endpoint {config['endpoint']}: {e.reason}") from e
+
+    response = json.loads(raw)
+    content = (response.get("message") or {}).get("content", "")
+    if not content:
+        raise RuntimeError(f"Empty content in LLM response. Full response: {response}")
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"LLM returned non-JSON content despite format=json. Error: {e}\n"
+            f"First 500 chars of content:\n{content[:500]}"
+        ) from e
+
+
+def extract_drawing(filepath: str, config: dict, dpi: int = 200) -> dict:
+    """End-to-end: read the PDF, render every page to an image, extract a
+    compact text-with-coordinates payload, and ask the configured LLM to
+    populate the drawing schema. Returns the structured dict."""
+    pdf_path = Path(filepath)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+    if not pdf_path.is_file():
+        raise ValueError(f"Not a file: {filepath}")
+
+    # Compact text payload (already token-efficient).
+    text_data = extract_text_with_coordinates(str(pdf_path), compact=True)
+    text_payload = format_as_compact_text(text_data)
+
+    # Rasterize every page for the multimodal LLM.
+    doc = pymupdf.open(str(pdf_path))
+    images_b64 = [render_page_to_base64_png(page, dpi=dpi) for page in doc]
+    doc.close()
+
+    prompt = (
+        f"{DRAWING_SCHEMA_DESCRIPTION}\n\n"
+        f"=== EXTRACTED TEXT SPANS (compact) ===\n"
+        f"{text_payload}\n\n"
+        f"Now produce the JSON object."
+    )
+
+    return call_ollama(config, prompt, images_b64)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Read a PDF file and print its contents to the console."
@@ -300,9 +518,25 @@ def main() -> None:
         help="With --coords, merge co-linear spans and emit a token-efficient text format",
     )
     parser.add_argument(
+        "--extract",
+        action="store_true",
+        help="Run the full extraction pipeline: render pages + send to LLM, output structured JSON",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to the JSON config file containing api_key/endpoint/model (defaults: $PDF_EXTRACTOR_CONFIG, then config.json beside this script)",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=200,
+        help="DPI for page rasterization sent to the LLM (default: 200)",
+    )
+    parser.add_argument(
         "-o", "--output",
         default=None,
-        help="With --coords, write the output to this file instead of stdout",
+        help="With --coords or --extract, write the output to this file (default for --extract: <pdf>.json)",
     )
     args = parser.parse_args()
 
@@ -322,7 +556,28 @@ def main() -> None:
             print("Error: No filepath provided.")
             sys.exit(1)
 
-    if args.coords:
+    if args.extract:
+        try:
+            config = load_config(args.config)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as e:
+            print(f"Config error: {e}")
+            sys.exit(1)
+
+        print(f"Using config from: {config.get('_source')}")
+        print(f"Endpoint: {config['endpoint']}  |  Model: {config['model']}")
+        print(f"Extracting drawing from {filepath} ...")
+
+        try:
+            structured = extract_drawing(filepath, config, dpi=args.dpi)
+        except (FileNotFoundError, ValueError, RuntimeError) as e:
+            print(f"Extraction error: {e}")
+            sys.exit(1)
+
+        out_path = Path(args.output) if args.output else Path(filepath).with_suffix(".json")
+        out_path.write_text(json.dumps(structured, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"Wrote structured drawing JSON to {out_path}")
+
+    elif args.coords:
         try:
             data = extract_text_with_coordinates(filepath, compact=args.compact)
         except (FileNotFoundError, ValueError) as e:

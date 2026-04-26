@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy this file to config.json and fill in your real values. config.json is read at startup; the api_key is never hardcoded in source.",
+  "api_key": "REPLACE_WITH_YOUR_API_KEY",
+  "endpoint": "https://your-ollama-host.example.com/api/chat",
+  "model": "llava"
+}
