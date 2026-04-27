@@ -365,9 +365,11 @@ def load_config(path: Optional[str] = None) -> dict:
 
     Expected file shape:
        {
-         "api_key":  "...",
-         "endpoint": "https://your-ollama-host.example.com/api/chat",
-         "model":    "llava"
+         "api_key":     "...",
+         "endpoint":    "https://your-ollama-host.example.com/api/chat",
+         "model":       "qwen3-vl",
+         "num_ctx":     65536,    # context window (override Ollama's 2048 default)
+         "num_predict": 8192      # max output tokens (override Ollama's 128 default)
        }
     """
     candidates: list = []
@@ -388,6 +390,11 @@ def load_config(path: Optional[str] = None) -> dict:
                 # Placeholder endpoint -- replace in your config.json
                 "endpoint": cfg.get("endpoint", "https://ollama.example.com/api/chat"),
                 "model": cfg.get("model", "llava"),
+                # Ollama's defaults (num_ctx=2048, num_predict=128) are far too
+                # small for this pipeline -- our prompt + image alone exceeds 2K
+                # tokens. 64K context / 8K output is a safe starting point.
+                "num_ctx": int(cfg.get("num_ctx", 65536)),
+                "num_predict": int(cfg.get("num_predict", 8192)),
                 "_source": str(p),
             }
 
@@ -411,32 +418,42 @@ def render_page_to_base64_png(page: Any, dpi: int = 200) -> str:
 
 
 def call_ollama(config: dict, prompt: str, images_b64: list, timeout: int = 300) -> dict:
-    """POST to an Ollama-compatible /api/chat endpoint with text + images and
-    return the parsed JSON response from `message.content`. Uses `format: json`
-    so the model is constrained to valid JSON output."""
+    """POST to an Ollama-compatible /api/generate endpoint with text + images
+    and return the parsed JSON response. Uses `format: json` so the model is
+    constrained to valid JSON output.
+
+    We use /api/generate (not /api/chat) because:
+      * Single-shot extraction doesn't need multi-turn chat semantics.
+      * The payload is simpler: a `prompt` string + `system` string + `images`.
+      * The response field is just `response`, not nested under `message.content`.
+    """
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {config['api_key']}",
     }
     payload = {
         "model": config["model"],
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert at parsing mechanical engineering drawings "
-                    "into structured JSON. You are precise, faithful to the drawing, "
-                    "and never invent values that are not visible."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-                "images": images_b64,
-            },
-        ],
+        "system": (
+            "You are an expert at parsing mechanical engineering drawings "
+            "into structured JSON. You are precise, faithful to the drawing, "
+            "and never invent values that are not visible."
+        ),
+        "prompt": prompt,
+        "images": images_b64,
         "stream": False,
         "format": "json",
+        # Disable thinking mode for thinking-capable models (Qwen3, etc.).
+        # When thinking is on AND format=json is set, these models tend to
+        # emit their JSON answer through the `thinking` channel instead of
+        # `response`, leaving the response field empty. We don't need
+        # exposed reasoning for structured extraction anyway.
+        "think": False,
+        # Ollama-specific runtime options. Without these the request is
+        # silently truncated to the model's tiny default context (2048).
+        "options": {
+            "num_ctx": config["num_ctx"],
+            "num_predict": config["num_predict"],
+        },
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -455,9 +472,19 @@ def call_ollama(config: dict, prompt: str, images_b64: list, timeout: int = 300)
         raise RuntimeError(f"Could not reach LLM endpoint {config['endpoint']}: {e.reason}") from e
 
     response = json.loads(raw)
-    content = (response.get("message") or {}).get("content", "")
+    # /api/generate returns the model output in the top-level `response` field.
+    # Fallback: some thinking-mode models route their JSON output through the
+    # `thinking` field even when format=json is set. We try response first,
+    # then thinking, so we're robust to either behavior.
+    content = response.get("response") or response.get("thinking") or ""
     if not content:
-        raise RuntimeError(f"Empty content in LLM response. Full response: {response}")
+        # Surface Ollama's done_reason (e.g. 'load', 'stop', 'length') -- it's
+        # the most useful clue when something goes wrong upstream.
+        done_reason = response.get("done_reason", "<unknown>")
+        raise RuntimeError(
+            f"Empty content in LLM response (done_reason={done_reason}). "
+            f"Full response: {response}"
+        )
 
     try:
         return json.loads(content)
@@ -536,7 +563,7 @@ def main() -> None:
     parser.add_argument(
         "-o", "--output",
         default=None,
-        help="With --coords or --extract, write the output to this file (default for --extract: <pdf>.json)",
+        help="With --coords or --extract, write the output to this file instead of stdout",
     )
     args = parser.parse_args()
 
@@ -565,6 +592,7 @@ def main() -> None:
 
         print(f"Using config from: {config.get('_source')}")
         print(f"Endpoint: {config['endpoint']}  |  Model: {config['model']}")
+        print(f"num_ctx: {config['num_ctx']}  |  num_predict: {config['num_predict']}")
         print(f"Extracting drawing from {filepath} ...")
 
         try:
@@ -573,9 +601,12 @@ def main() -> None:
             print(f"Extraction error: {e}")
             sys.exit(1)
 
-        out_path = Path(args.output) if args.output else Path(filepath).with_suffix(".json")
-        out_path.write_text(json.dumps(structured, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"Wrote structured drawing JSON to {out_path}")
+        output_text = json.dumps(structured, indent=2, ensure_ascii=False)
+        if args.output:
+            Path(args.output).write_text(output_text, encoding="utf-8")
+            print(f"Wrote structured drawing JSON to {args.output}")
+        else:
+            print(output_text)
 
     elif args.coords:
         try:
