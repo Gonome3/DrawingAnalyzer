@@ -58,6 +58,11 @@ def main() -> None:
         help="DPI for page rasterization sent to the LLM (default: 200)",
     )
     parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="With --extract, print the assembled LLM prompt and context-usage stats before the call (debugging aid for gauging context window usage)",
+    )
+    parser.add_argument(
         "-o", "--output",
         default=None,
         help="With --compact or --extract, write the output to this file instead of stdout",
@@ -93,7 +98,9 @@ def main() -> None:
         print(f"Extracting drawing from {filepath} ...")
 
         try:
-            structured = extract_drawing(filepath, config, dpi=args.dpi)
+            structured = extract_drawing(
+                filepath, config, dpi=args.dpi, verbose=args.verbose
+            )
         except (FileNotFoundError, ValueError, RuntimeError) as e:
             print(f"Extraction error: {e}")
             sys.exit(1)

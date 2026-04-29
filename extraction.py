@@ -82,10 +82,21 @@ RULES:
 6. Output ONLY the JSON object -- no commentary, no markdown fences."""
 
 
-def extract_drawing(filepath: str, config: dict, dpi: int = 200) -> dict:
+def extract_drawing(
+    filepath: str,
+    config: dict,
+    dpi: int = 200,
+    verbose: bool = False,
+) -> dict:
     """End-to-end: read the PDF, render every page to an image, extract a
     compact text-with-coordinates payload, and ask the configured LLM to
-    populate the drawing schema. Returns the structured dict."""
+    populate the drawing schema. Returns the structured dict.
+
+    When `verbose=True`, prints the assembled LLM prompt and a small stats
+    footer (character count, rough text-token estimate, image count, and
+    configured num_ctx) so you can gauge how much of the context window
+    is being consumed.
+    """
     pdf_path = Path(filepath)
     if not pdf_path.exists():
         raise FileNotFoundError(f"File not found: {filepath}")
@@ -105,5 +116,29 @@ def extract_drawing(filepath: str, config: dict, dpi: int = 200) -> dict:
         f"{text_payload}\n\n"
         f"Now produce the JSON object."
     )
+
+    if verbose:
+        bar = "=" * 70
+        print(bar)
+        print("LLM PROMPT (text portion):")
+        print(bar)
+        print(prompt)
+        print(bar)
+        # Rough tokenization heuristic: ~4 chars/token for English-like text.
+        # Real model tokenizers vary, but this gives a useful order-of-magnitude.
+        approx_tokens = len(prompt) // 4
+        print(
+            f"Prompt size: {len(prompt):,} chars  "
+            f"(~{approx_tokens:,} text tokens) + {len(images_b64)} image(s)"
+        )
+        print(
+            f"Configured num_ctx: {config['num_ctx']:,}  |  "
+            f"num_predict: {config['num_predict']:,}"
+        )
+        print(
+            "Note: image token cost is model-specific and not included in the "
+            "char/token count above."
+        )
+        print(bar)
 
     return call_ollama(config, prompt, images_b64)
