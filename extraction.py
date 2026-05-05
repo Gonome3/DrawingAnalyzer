@@ -129,8 +129,44 @@ def extract_drawing(
         approx_tokens = len(prompt) // 4
         print(
             f"Prompt size: {len(prompt):,} chars  "
-            f"(~{approx_tokens:,} text tokens) + {len(images_b64)} image(s)"
+            f"(~{approx_tokens:,} text tokens)"
         )
+
+        # Image payload size: this is what dominates the HTTP request body.
+        # Reverse proxies (nginx, k8s ingress) often cap body size at 1-2 MB
+        # by default, so it's worth surfacing the actual number.
+        image_byte_sizes = [len(img) for img in images_b64]
+        total_image_bytes = sum(image_byte_sizes)
+        mb = 1024 * 1024
+        if len(images_b64) == 1:
+            print(
+                f"Image payload: {total_image_bytes / mb:.2f} MB "
+                f"(1 page, base64-encoded)"
+            )
+        else:
+            avg = total_image_bytes / len(images_b64)
+            print(
+                f"Image payload: {total_image_bytes / mb:.2f} MB total "
+                f"({len(images_b64)} pages, avg {avg / mb:.2f} MB each, base64-encoded)"
+            )
+
+        # Approximate total HTTP request body (text + images + JSON envelope
+        # overhead is small enough to ignore at this resolution).
+        total_body_bytes = len(prompt) + total_image_bytes
+        print(f"Approx total request body: {total_body_bytes / mb:.2f} MB")
+
+        # Soft warning if we're near a typical proxy default (1 MB on stock
+        # nginx). The user may need to raise the proxy limit, lower the DPI,
+        # or accept the failure -- this lets them see the cliff before they
+        # fall off it.
+        if total_image_bytes > mb:
+            print(
+                "Note: image payload exceeds 1 MB. If your endpoint is behind "
+                "a default-config nginx/ingress, this may hit a 413 (Request "
+                "Too Large) limit. Consider lowering --dpi or raising the "
+                "proxy's client_max_body_size."
+            )
+
         print(
             f"Configured num_ctx: {config['num_ctx']:,}  |  "
             f"num_predict: {config['num_predict']:,}"
