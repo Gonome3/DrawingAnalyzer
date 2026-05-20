@@ -63,24 +63,7 @@ SCHEMA (all fields nullable if absent in the drawing; arrays may be empty):
       "view": "front"|"top"|"right"|"left"|"bottom"|"back"|"isometric"|"section"|"detail"|"auxiliary"|"other"|null,
       "view_label": str|null,    // copy of the parent view's label (e.g. "SECTION A-A") for disambiguation
       "axis": "x"|"y"|"z"|null,
-      "feature_ref": "f1"|null,
       "modifier": "TYP"|"REF"|"BASIC"|null,
-      "source_text": str
-    }
-  ],
-  "features": [
-    {
-      "id": "f1",
-      "kind": "through_hole"|"blind_hole"|"threaded_hole"|"counterbore"|
-              "countersink"|"fillet"|"chamfer"|"slot"|"pocket"|"other",
-      "diameter":    {"value": float, "unit": "in"|"mm"}|null,
-      "depth":       {"value": float, "unit": "in"|"mm"}|null,
-      "radius":      {"value": float, "unit": "in"|"mm"}|null,
-      "thread_spec": str|null,
-      "modifier":    "THRU"|null,
-      "applies_to":  "all_corners"|"all_edges"|null,
-      "view":        "front"|"top"|"right"|"left"|"bottom"|"back"|"isometric"|"section"|"detail"|"auxiliary"|"other"|null,
-      "view_label":  str|null,
       "source_text": str
     }
   ],
@@ -109,25 +92,21 @@ RULES:
 3. ALWAYS include `source_text` -- the EXACT string as it appears on the
    drawing. The verifier will check that this string is present in the
    extracted text spans; fabricated source_text will be flagged.
-4. Use ids "d1", "d2", ... for dimensions and "f1", "f2", ... for features.
-5. For `feature_ref`: set this only when you can clearly trace (via leader
-   lines or close proximity) that the dimension describes a specific
-   feature. When uncertain, set `feature_ref: null`. Do NOT guess.
-6. For `semantic_role`, apply these decision rules in order:
+4. Use ids "d1", "d2", ... for dimensions.
+5. For `semantic_role`, apply these decision rules in order:
    a. If the dimension spans the full outer extent of the part profile
       along an axis -> `overall_length`, `overall_width`, or
       `overall_height` based on which axis the dimension is on.
-   b. If the dimension's leader line points clearly to a hole feature ->
-      `hole_diameter` or `hole_depth`, and link via `feature_ref`.
-   c. If the dimension is a radius callout linked to a fillet ->
-      `fillet_radius`, and link via `feature_ref`.
+   b. If the dimension's leader line points clearly to a hole ->
+      `hole_diameter` or `hole_depth`.
+   c. If the dimension is a radius callout on a fillet ->
+      `fillet_radius`.
    d. If the dimension's leader line clearly connects an edge to a
-      specific feature -> `edge_to_feature_distance`, and link via
-      `feature_ref`.
+      specific feature on the part -> `edge_to_feature_distance`.
    e. Otherwise -> `null`. Do NOT default to "edge_to_feature_distance"
       or "other" when uncertain. A null semantic_role is more useful
       downstream than a wrong label.
-7. For `drawing_summary`: provide a brief factual description of the
+6. For `drawing_summary`: provide a brief factual description of the
    part based on what is visible on the drawing (1-3 sentences).
    Describe shape, prominent features, and orientation, not purpose
    unless purpose is explicit. `part_type` should be a short lowercase
@@ -135,26 +114,29 @@ RULES:
    `primary_function` only if explicitly indicated by the drawing or
    its title; otherwise null. If the part cannot be characterised
    meaningfully, set `drawing_summary` to null.
-8. For views:
+7. For views:
    a. In the top-level `views` array, enumerate every distinct view
       present on the drawing (e.g. front, isometric, section,
       detail). Section and detail views MUST include their label
       exactly as shown on the drawing (e.g. "SECTION A-A",
       "DETAIL B"). Only set `scale` when a view is explicitly
       labelled with a scale that differs from the main drawing scale.
-   b. For each dimension's or feature's `view` field, identify which
-      view from the `views` array the annotation sits inside. The
-      per-annotation `view` value must be consistent with the
-      enumerated views.
+   b. For each dimension's `view` field, identify which view from the
+      `views` array the annotation sits inside. The per-annotation
+      `view` value must be consistent with the enumerated views.
    c. If the parent view in the `views` array has a `label`
       (e.g. "SECTION A-A", "DETAIL B"), copy that label verbatim
-      into the dimension's or feature's `view_label` field so that
-      annotations belonging to different sections or details can be
+      into the dimension's `view_label` field so that annotations
+      belonging to different sections or details can be
       distinguished. For views without a label (front, top, iso,
       etc.), set `view_label` to null.
-9. For `uncovered_annotations`: list any annotation visible on the
+8. For `uncovered_annotations`: list any annotation visible on the
    drawing that does NOT fit into any other schema field. Examples
    of things that belong here:
+     - Hole, thread, chamfer, fillet, and other feature callouts
+       (the schema captures their dimensions but not the feature
+       descriptor itself; record e.g. "M6 threaded hole callout"
+       or "1x45° chamfer applied to all edges")
      - GD&T feature control frames (perpendicularity, parallelism,
        position tolerances, often with datum references like ⊥ 0.5 B)
      - Datum reference labels (the boxed A, B, C, D, E, F symbols)
@@ -175,7 +157,7 @@ RULES:
    genuinely unsupported annotation types only. Err on the side of
    including more rather than fewer: this list is used to measure
    schema coverage gaps, so missing entries are worse than extra ones.
-10. Output ONLY the JSON object -- no commentary, no markdown fences."""
+9. Output ONLY the JSON object -- no commentary, no markdown fences."""
 
 
 def _normalize_for_text_match(text: str) -> str:
@@ -193,9 +175,9 @@ def _normalize_for_text_match(text: str) -> str:
 
 
 def verify_extraction_against_text(structured: dict, text_data: dict) -> dict:
-    """Walk every dimension and feature in the structured output and confirm
-    that the `source_text` field actually appears in the extracted PDF text
-    spans. Catches hallucinations where the model invented values that don't
+    """Walk every dimension in the structured output and confirm that the
+    `source_text` field actually appears in the extracted PDF text spans.
+    Catches hallucinations where the model invented values that don't
     exist on the drawing.
 
     Mutates the structured dict in two ways:
@@ -251,9 +233,6 @@ def verify_extraction_against_text(structured: dict, text_data: dict) -> dict:
                 tol["source"] = "unverified"
                 dim["tolerance"] = tol
 
-    for feat in structured.get("features") or []:
-        _check(feat, "feature")
-
     structured["_verification"] = {
         "checked": True,
         "issue_count": len(issues),
@@ -262,10 +241,10 @@ def verify_extraction_against_text(structured: dict, text_data: dict) -> dict:
     return structured
 
 
-# Canonical reading order for views, used when sorting dimensions and
-# features so the output JSON groups annotations by which view they belong
-# to. Front comes first (primary view), orthographic projections next,
-# then isometric, then callout-style views (section, detail), with
+# Canonical reading order for views, used when sorting dimensions so the
+# output JSON groups annotations by which view they belong to. Front
+# comes first (primary view), orthographic projections next, then
+# isometric, then callout-style views (section, detail), with
 # auxiliary/other last. Unknown or null views sort to the end of the list.
 _VIEW_ORDER = [
     "front", "top", "right", "left", "bottom", "back",
@@ -274,12 +253,12 @@ _VIEW_ORDER = [
 
 
 def _view_sort_key(item: dict) -> tuple:
-    """Sort key that groups dimensions/features by view in the canonical
-    reading order defined by `_VIEW_ORDER`, then sub-groups by
-    `view_label` so multiple sections or details cluster cleanly
-    (all SECTION A-A entries before all SECTION B-B entries, etc.).
-    `source_text` provides a final tiebreaker so output is deterministic
-    across runs (modulo LLM stochasticity in the upstream extraction).
+    """Sort key that groups dimensions by view in the canonical reading
+    order defined by `_VIEW_ORDER`, then sub-groups by `view_label` so
+    multiple sections or details cluster cleanly (all SECTION A-A
+    entries before all SECTION B-B entries, etc.). `source_text`
+    provides a final tiebreaker so output is deterministic across
+    runs (modulo LLM stochasticity in the upstream extraction).
     """
     view = item.get("view")
     try:
@@ -397,15 +376,13 @@ def extract_drawing(
     # explicit tolerances to "unverified" when their source_text is missing.
     structured = verify_extraction_against_text(structured, text_data)
 
-    # Group output by view for readability. The LLM emits dimensions and
-    # features in roughly the order it processed them, which often jumps
-    # between views. Sorting here is post-processing only -- the data is
+    # Group output by view for readability. The LLM emits dimensions in
+    # roughly the order it processed them, which often jumps between
+    # views. Sorting here is post-processing only -- the data is
     # unchanged, just reordered, so downstream consumers that read by ID
     # (d1, d2, ...) are unaffected.
     if structured.get("dimensions"):
         structured["dimensions"].sort(key=_view_sort_key)
-    if structured.get("features"):
-        structured["features"].sort(key=_view_sort_key)
 
     n_issues = (structured.get("_verification") or {}).get("issue_count", 0)
     if n_issues:
