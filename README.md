@@ -29,3 +29,7 @@ Example command:
 call pdf reader, input test.pdf extract coords of text, compact the prompt for less token usage use the qwen3-vl config
 
 `python pdf_reader.py "SAP A\Axel\21015-A.pdf" --compact --extract --config config-qwen3-vl.json -v -o SAP-A-Axel-21015-A.json`
+
+
+Extraction evaluator:
+`python evaluate.py ground_truth extractions --model qwen3-vl --output eval_results --verbose`
