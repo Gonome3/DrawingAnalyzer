@@ -26,6 +26,27 @@ from pdf_text import (
 from extraction import extract_drawing
 
 
+def _resolve_output_path(arg_value, input_filepath: str, extension: str):
+    """Resolve the `-o/--output` argument to a concrete `Path`, or `None`.
+
+    The CLI's `-o` flag supports three states:
+      * not provided        -> `arg_value` is `None`, we return `None`
+                               (caller should print to stdout)
+      * `-o some/file.json` -> `arg_value` is a path string, returned as-is
+      * `-o` alone          -> `arg_value` is the sentinel "__auto__",
+                               we auto-generate a path in `output/` using
+                               the input PDF's stem and the given extension
+    The `output/` folder lives next to this script and is auto-created.
+    """
+    if not arg_value:
+        return None
+    if arg_value == "__auto__":
+        output_dir = Path(__file__).parent / "output"
+        output_dir.mkdir(exist_ok=True)
+        return output_dir / f"{Path(input_filepath).stem}.{extension}"
+    return Path(arg_value)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Read a PDF file and print its contents to the console."
@@ -64,8 +85,12 @@ def main() -> None:
     )
     parser.add_argument(
         "-o", "--output",
+        nargs="?",
+        const="__auto__",
         default=None,
-        help="With --compact or --extract, write the output to this file instead of stdout",
+        help="With --compact or --extract, write the output to a file instead of stdout. "
+             "Provide a path to write to that exact location, or use -o alone (without a "
+             "filename) to auto-generate output/<input-stem>.json (or .txt for --compact).",
     )
     args = parser.parse_args()
 
@@ -106,9 +131,10 @@ def main() -> None:
             sys.exit(1)
 
         output_text = json.dumps(structured, indent=2, ensure_ascii=False)
-        if args.output:
-            Path(args.output).write_text(output_text, encoding="utf-8")
-            print(f"Wrote structured drawing JSON to {args.output}")
+        output_path = _resolve_output_path(args.output, filepath, "json")
+        if output_path is not None:
+            output_path.write_text(output_text, encoding="utf-8")
+            print(f"Wrote structured drawing JSON to {output_path}")
         else:
             print(output_text)
 
@@ -120,12 +146,13 @@ def main() -> None:
             sys.exit(1)
 
         output_text = format_as_compact_text(data)
-        if args.output:
-            Path(args.output).write_text(output_text, encoding="utf-8")
+        output_path = _resolve_output_path(args.output, filepath, "txt")
+        if output_path is not None:
+            output_path.write_text(output_text, encoding="utf-8")
             total_spans = sum(len(p["spans"]) for p in data["pages"])
             print(
                 f"Wrote {total_spans} text spans across {data['page_count']} page(s) "
-                f"to {args.output}"
+                f"to {output_path}"
             )
         else:
             print(output_text)

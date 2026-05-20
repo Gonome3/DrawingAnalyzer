@@ -28,6 +28,11 @@ SCHEMA (all fields nullable if absent in the drawing; arrays may be empty):
     "material": str, "finish": str, "projection": "third_angle"|"first_angle"|null,
     "sheet": {"current": int, "total": int}, "company": str
   },
+  "drawing_summary": {
+    "description":      str,     // 1-3 sentence factual description of the part
+    "part_type":        str|null, // short lowercase noun, e.g. "plate", "bracket"
+    "primary_function": str|null  // only if explicitly indicated on the drawing
+  }|null,
   "default_tolerances": {
     "linear_2_place": {"plus": float, "minus": float, "unit": "in"|"mm"},
     "linear_3_place": {"plus": float, "minus": float, "unit": "in"|"mm"},
@@ -36,6 +41,14 @@ SCHEMA (all fields nullable if absent in the drawing; arrays may be empty):
   "approvals":  [{"role": "drawn"|"reviewed"|"approved", "name": str, "date": "YYYY-MM-DD"}],
   "revisions":  [{"rev": str, "description": str, "date": "YYYY-MM-DD", "approved_by": str}],
   "notes":      [{"number": int, "text": str}],
+  "views": [
+    {
+      "kind":  "front"|"top"|"right"|"left"|"bottom"|"back"|
+               "isometric"|"section"|"detail"|"auxiliary"|"other",
+      "label": str|null,    // e.g. "SECTION A-A", "DETAIL B"
+      "scale": str|null     // only if explicitly different from main scale
+    }
+  ],
   "dimensions": [
     {
       "id": "d1", "kind": "linear"|"radius"|"diameter"|"angle",
@@ -47,7 +60,8 @@ SCHEMA (all fields nullable if absent in the drawing; arrays may be empty):
       "semantic_role": "overall_length"|"overall_width"|"overall_height"|
                        "edge_to_feature_distance"|"hole_diameter"|"hole_depth"|
                        "fillet_radius"|"thread_depth"|"other"|null,
-      "view": "front"|"top"|"right"|"left"|"isometric"|"section"|"detail"|null,
+      "view": "front"|"top"|"right"|"left"|"bottom"|"back"|"isometric"|"section"|"detail"|"auxiliary"|"other"|null,
+      "view_label": str|null,    // copy of the parent view's label (e.g. "SECTION A-A") for disambiguation
       "axis": "x"|"y"|"z"|null,
       "feature_ref": "f1"|null,
       "modifier": "TYP"|"REF"|"BASIC"|null,
@@ -65,11 +79,13 @@ SCHEMA (all fields nullable if absent in the drawing; arrays may be empty):
       "thread_spec": str|null,
       "modifier":    "THRU"|null,
       "applies_to":  "all_corners"|"all_edges"|null,
-      "view":        "front"|"top"|"right"|"left"|"isometric"|"section"|"detail"|null,
+      "view":        "front"|"top"|"right"|"left"|"bottom"|"back"|"isometric"|"section"|"detail"|"auxiliary"|"other"|null,
+      "view_label":  str|null,
       "source_text": str
     }
   ],
-  "surface_finish": {"minimum_ra": int, "applies_unless_otherwise_specified": bool}|null
+  "surface_finish": {"minimum_ra": int, "applies_unless_otherwise_specified": bool}|null,
+  "uncovered_annotations": [str]   // brief descriptions of visible annotations that don't fit other schema fields (GD&T frames, datum refs, component data tables, etc.)
 }
 
 RULES:
@@ -111,8 +127,55 @@ RULES:
    e. Otherwise -> `null`. Do NOT default to "edge_to_feature_distance"
       or "other" when uncertain. A null semantic_role is more useful
       downstream than a wrong label.
-7. Determine `view` from which view the annotation sits inside.
-8. Output ONLY the JSON object -- no commentary, no markdown fences."""
+7. For `drawing_summary`: provide a brief factual description of the
+   part based on what is visible on the drawing (1-3 sentences).
+   Describe shape, prominent features, and orientation, not purpose
+   unless purpose is explicit. `part_type` should be a short lowercase
+   noun (e.g. "plate", "bracket", "shaft", "housing"). Set
+   `primary_function` only if explicitly indicated by the drawing or
+   its title; otherwise null. If the part cannot be characterised
+   meaningfully, set `drawing_summary` to null.
+8. For views:
+   a. In the top-level `views` array, enumerate every distinct view
+      present on the drawing (e.g. front, isometric, section,
+      detail). Section and detail views MUST include their label
+      exactly as shown on the drawing (e.g. "SECTION A-A",
+      "DETAIL B"). Only set `scale` when a view is explicitly
+      labelled with a scale that differs from the main drawing scale.
+   b. For each dimension's or feature's `view` field, identify which
+      view from the `views` array the annotation sits inside. The
+      per-annotation `view` value must be consistent with the
+      enumerated views.
+   c. If the parent view in the `views` array has a `label`
+      (e.g. "SECTION A-A", "DETAIL B"), copy that label verbatim
+      into the dimension's or feature's `view_label` field so that
+      annotations belonging to different sections or details can be
+      distinguished. For views without a label (front, top, iso,
+      etc.), set `view_label` to null.
+9. For `uncovered_annotations`: list any annotation visible on the
+   drawing that does NOT fit into any other schema field. Examples
+   of things that belong here:
+     - GD&T feature control frames (perpendicularity, parallelism,
+       position tolerances, often with datum references like ⊥ 0.5 B)
+     - Datum reference labels (the boxed A, B, C, D, E, F symbols)
+     - Component-specific data tables (gear tooth specifications,
+       thread tables, hole charts)
+     - Conditional tolerance tables (e.g. "measurements before
+       heat treatment")
+     - Per-feature surface finish callouts (Ra symbols pointing to
+       a specific surface rather than the whole part)
+     - External document references (e.g. "see measuring
+       instructions KM 0022")
+     - Process specification notes (heat treatment, coating,
+       surface treatment per a referenced specification)
+   Each entry is a brief descriptive string explaining what the
+   annotation is and what it relates to. Use an empty list if no
+   such annotations exist. Do NOT use this field to hide ambiguity
+   for annotations that DO fit other schema fields -- it is for
+   genuinely unsupported annotation types only. Err on the side of
+   including more rather than fewer: this list is used to measure
+   schema coverage gaps, so missing entries are worse than extra ones.
+10. Output ONLY the JSON object -- no commentary, no markdown fences."""
 
 
 def _normalize_for_text_match(text: str) -> str:
@@ -197,6 +260,38 @@ def verify_extraction_against_text(structured: dict, text_data: dict) -> dict:
         "issues": issues,
     }
     return structured
+
+
+# Canonical reading order for views, used when sorting dimensions and
+# features so the output JSON groups annotations by which view they belong
+# to. Front comes first (primary view), orthographic projections next,
+# then isometric, then callout-style views (section, detail), with
+# auxiliary/other last. Unknown or null views sort to the end of the list.
+_VIEW_ORDER = [
+    "front", "top", "right", "left", "bottom", "back",
+    "isometric", "section", "detail", "auxiliary", "other",
+]
+
+
+def _view_sort_key(item: dict) -> tuple:
+    """Sort key that groups dimensions/features by view in the canonical
+    reading order defined by `_VIEW_ORDER`, then sub-groups by
+    `view_label` so multiple sections or details cluster cleanly
+    (all SECTION A-A entries before all SECTION B-B entries, etc.).
+    `source_text` provides a final tiebreaker so output is deterministic
+    across runs (modulo LLM stochasticity in the upstream extraction).
+    """
+    view = item.get("view")
+    try:
+        view_index = _VIEW_ORDER.index(view) if view else len(_VIEW_ORDER)
+    except ValueError:
+        # View kind not in our canonical list -- sort to the end.
+        view_index = len(_VIEW_ORDER)
+    return (
+        view_index,
+        item.get("view_label") or "",
+        item.get("source_text") or "",
+    )
 
 
 def extract_drawing(
@@ -301,6 +396,16 @@ def extract_drawing(
     # This adds a `_verification` block to the output and demotes claimed-
     # explicit tolerances to "unverified" when their source_text is missing.
     structured = verify_extraction_against_text(structured, text_data)
+
+    # Group output by view for readability. The LLM emits dimensions and
+    # features in roughly the order it processed them, which often jumps
+    # between views. Sorting here is post-processing only -- the data is
+    # unchanged, just reordered, so downstream consumers that read by ID
+    # (d1, d2, ...) are unaffected.
+    if structured.get("dimensions"):
+        structured["dimensions"].sort(key=_view_sort_key)
+    if structured.get("features"):
+        structured["features"].sort(key=_view_sort_key)
 
     n_issues = (structured.get("_verification") or {}).get("issue_count", 0)
     if n_issues:
