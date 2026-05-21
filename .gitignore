@@ -6,3 +6,15 @@ stakeholder_meeting_notes.md
 /output
 /input
 /ground_truth
+/__pycache__
+/__pycache__
+*.pyc
+/extractions
+/eval_results
+/program
+/__pycache__
+/__pycache__
+config-gemma4.json
+config-qwen3-vl-32b-thinking-q8.json
+config-qwen3-vl-32b.json
+config-qwen3.5-32b.json

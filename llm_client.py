@@ -4,8 +4,12 @@ Owns two responsibilities:
   * Page rendering -- turn a PDF (or a PyMuPDF page) into base64-encoded
     PNG strings ready to send as multimodal input.
   * The actual /api/generate POST -- with text + images, structured-JSON
-    output, thinking mode disabled, and the runtime context overrides
-    that Ollama's tiny defaults make mandatory.
+    output, optional thinking-mode control, and the runtime context
+    overrides that Ollama's tiny defaults make mandatory.
+
+The `think` field in config.json is optional: include it (as true or
+false) for models that support thinking mode (Qwen3, etc.); omit it
+entirely for models that don't (Gemma 3, Llama, etc.).
 """
 
 import sys
@@ -89,12 +93,6 @@ def call_ollama(config: dict, prompt: str, images_b64: list, timeout: int = 300)
         # disconnections.
         "stream": True,
         "format": "json",
-        # Disable thinking mode for thinking-capable models (Qwen3, etc.).
-        # When thinking is on AND format=json is set, these models tend to
-        # emit their JSON answer through the `thinking` channel instead of
-        # `response`, leaving the response field empty. We don't need
-        # exposed reasoning for structured extraction anyway.
-        "think": False,
         # Ollama-specific runtime options. Without these the request is
         # silently truncated to the model's tiny default context (2048).
         "options": {
@@ -102,6 +100,16 @@ def call_ollama(config: dict, prompt: str, images_b64: list, timeout: int = 300)
             "num_predict": config["num_predict"],
         },
     }
+
+    # Thinking mode is only meaningful for thinking-capable models
+    # (Qwen3, etc.). On those models we set `think: false` because
+    # combining thinking with format=json routes the JSON output into
+    # the `thinking` channel instead of `response`, leaving the
+    # response field empty. Other models (Gemma, Llama, etc.) don't
+    # understand the parameter, so we only include it when the config
+    # explicitly sets it.
+    if config.get("think") is not None:
+        payload["think"] = config["think"]
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         config["endpoint"], data=body, headers=headers, method="POST"

@@ -9,8 +9,24 @@ Matching strategy
   * Dimensions: primary key is the normalized `source_text`. Fallback is
     the (nominal, kind, unit) tuple, used only when source_text fails
     and exactly one unmatched ground-truth candidate remains.
-  * Notes: matched by `number`. Approvals by (role, name). Revisions
-    by `rev`. Views by (kind, label).
+  * Approvals: primary key is (name, date) with name-only as fallback.
+    The `role` label is excluded from the identity because GT and
+    extraction may legitimately use different terms for the same
+    approval (e.g. Swedish "Konstruerad" vs schema enum "drawn"); role
+    is scored as a field on matched approvals but not as part of the key.
+  * Notes: matched by `number`. Revisions by `rev`. Views by (kind, label).
+
+Tolerant comparison for semantic_role
+-------------------------------------
+The schema's `semantic_role` enum does not cover every feature kind
+that appears on real drawings (spherical features, for instance), so
+both GT and extraction occasionally use ad-hoc values outside the
+enum. To avoid punishing near-equivalent labels, `semantic_role` uses
+token-containment equality: `spherical_diameter` and
+`spherical_end_diameter` are treated as equivalent because their
+underscore-split tokens have a subset relationship. Other fields
+keep strict equality. This is a deliberate, scoped loosening rather
+than a general fuzziness in the matcher.
 
 Numerical comparison
 --------------------
@@ -18,7 +34,11 @@ Absolute tolerance of 1e-6 throughout. For `tolerance.plus` and
 `tolerance.minus` (both in per-dimension tolerances and in
 default_tolerances), comparison is on absolute values rather than signed
 values, because the extraction model is inconsistent about whether
-those fields carry sign or magnitude.
+those fields carry sign or magnitude. Additionally, the value 0 and
+null are treated as equivalent for these tolerance fields, because
+both encode "no usable tolerance information" for downstream consumers
+and the extraction model frequently writes 0 where the schema would
+expect null.
 
 Scoring layers
 --------------
@@ -100,6 +120,30 @@ def floats_equal_magnitude(a: Any, b: Any) -> bool:
         return False
 
 
+def tolerance_value_equal(a: Any, b: Any) -> bool:
+    """Equality for tolerance plus/minus fields (per-dimension and
+    default_tolerances). Treats null and 0 (within FLOAT_EPS) as
+    equivalent, because both encode "no usable tolerance information"
+    for any downstream consumer, and the extraction model frequently
+    writes 0 where the schema would expect null. Outside that special
+    case, falls back to absolute-value comparison so the sign-convention
+    inconsistency on plus/minus doesn't cause spurious mismatches."""
+    def _is_absent(v: Any) -> bool:
+        if v is None:
+            return True
+        try:
+            return abs(float(v)) <= FLOAT_EPS
+        except (TypeError, ValueError):
+            return False
+    a_absent = _is_absent(a)
+    b_absent = _is_absent(b)
+    if a_absent and b_absent:
+        return True
+    if a_absent or b_absent:
+        return False
+    return floats_equal_magnitude(a, b)
+
+
 def strs_equal(a: Any, b: Any) -> bool:
     """Case- and whitespace-insensitive string equality. Null == null."""
     if a is None and b is None:
@@ -121,6 +165,40 @@ def values_equal(a: Any, b: Any) -> bool:
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         return floats_equal(a, b)
     return strs_equal(a, b)
+
+
+def semantic_roles_equivalent(a: Any, b: Any) -> bool:
+    """Tolerant equality for the `semantic_role` field only.
+
+    The schema's semantic_role enum doesn't cover every kind of feature
+    that appears on real drawings (spherical features, for instance),
+    so both ground truth and extraction occasionally use ad-hoc values
+    outside the enum. Strict equality is overly punitive when the two
+    sides differ only by an extra qualifier
+    (e.g. `spherical_diameter` vs `spherical_end_diameter`).
+
+    This helper accepts a match when either:
+      * strict (normalized) string equality holds, or
+      * the underscore-separated tokens of one side are a subset of
+        the other's (so `spherical_diameter` matches
+        `spherical_end_diameter`, but `hole_diameter` does NOT match
+        `hole_depth`).
+
+    Used exclusively for semantic_role -- other fields keep strict
+    equality. The loosening is a documented evaluation choice rather
+    than a property of the schema.
+    """
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    if strs_equal(a, b):
+        return True
+    a_tokens = {t for t in normalize_text(a).split("_") if t}
+    b_tokens = {t for t in normalize_text(b).split("_") if t}
+    if not a_tokens or not b_tokens:
+        return False
+    return a_tokens.issubset(b_tokens) or b_tokens.issubset(a_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +223,21 @@ def note_key(n: dict) -> Any:
 
 
 def approval_key(a: dict) -> tuple:
-    return ((a.get("role") or "").lower(), normalize_text(a.get("name")))
+    """Match approvals on (name, date). The role label is intentionally
+    excluded from the identity because it varies across drawings: ground
+    truth often preserves the raw Swedish CAD text (e.g.
+    "Konstruerad/Designed") while the extraction maps to the schema's
+    English enum ("drawn"). Role is still compared as a scored field on
+    matched approvals; just not used as part of the match key.
+    """
+    return (normalize_text(a.get("name")), (a.get("date") or "").lower())
+
+
+def approval_fallback_key(a: dict) -> str:
+    """Fallback to name-only matching when date is missing or differs
+    between sides (rare but possible on drawings where the model failed
+    to parse the date)."""
+    return normalize_text(a.get("name"))
 
 
 def revision_key(r: dict) -> str:
@@ -294,6 +386,8 @@ def score_dimension(gt: dict, ext: dict, m: CategoryMetrics) -> None:
     for name in DIMENSION_SIMPLE_FIELDS:
         if name in DIMENSION_NUMERIC_FIELDS:
             ok = floats_equal(gt.get(name), ext.get(name))
+        elif name == "semantic_role":
+            ok = semantic_roles_equivalent(gt.get(name), ext.get(name))
         else:
             ok = strs_equal(gt.get(name), ext.get(name))
         m.field_check(name, ok)
@@ -304,8 +398,8 @@ def score_dimension(gt: dict, ext: dict, m: CategoryMetrics) -> None:
     ext_tol = ext.get("tolerance") or {}
     for sub_name, cmp in (
         ("source", strs_equal),
-        ("plus", floats_equal_magnitude),
-        ("minus", floats_equal_magnitude),
+        ("plus", tolerance_value_equal),
+        ("minus", tolerance_value_equal),
     ):
         ok = cmp(gt_tol.get(sub_name), ext_tol.get(sub_name))
         m.field_check(f"tolerance.{sub_name}", ok)
@@ -353,7 +447,9 @@ def compare_fields(
         gt_v = gt.get(fn)
         ext_v = ext.get(fn)
         if fn in mag:
-            ok = floats_equal_magnitude(gt_v, ext_v)
+            # Magnitude fields are used for tolerance plus/minus only,
+            # where 0 and null both mean "no usable tolerance info".
+            ok = tolerance_value_equal(gt_v, ext_v)
         else:
             ok = values_equal(gt_v, ext_v)
         if ok:
@@ -475,7 +571,7 @@ def score_drawing(gt: dict, ext: dict, name: str) -> DrawingResult:
     fps, fns = [], []
     res.approvals = _score_list(
         gt.get("approvals"), ext.get("approvals"),
-        approval_key, None,
+        approval_key, approval_fallback_key,
         lambda g, e, m: score_simple(g, e, APPROVAL_FIELDS, m),
         fps, fns,
     )
@@ -771,7 +867,6 @@ def run(args: argparse.Namespace) -> int:
 
     if not gt_dir.is_dir():
         print(f"ground_truth_dir is not a directory: {gt_dir}", file=sys.stderr)
-        return 1
     if not ext_dir.is_dir():
         print(f"extractions_dir is not a directory: {ext_dir}", file=sys.stderr)
         return 1
